@@ -7,7 +7,6 @@ try:
     import resource
 except:
     NO_RESOURCE = True
-import subprocess
 import sys
 import time
 import typing
@@ -15,6 +14,7 @@ import gzip
 import argparse
 import os
 from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 
 
 TEN_MB: typing.Final = 10_000_000
@@ -198,11 +198,11 @@ def parse_line(line: str, format: str) -> tuple[str, str, int, int, str, int, in
     Returns (direction, query_seq_name, query_start, query_end, target_seq_name, target_start, target_end)
     """
     if format == "paf":
-        query_seq_name, query_seq_len, query_start, query_end, direction, \
-        target_seq_name, target_seq_len, target_start, target_end = line.split()[:9]    
+        query_seq_name, _, query_start, query_end, direction, \
+        target_seq_name, _, target_start, target_end = line.split()[:9]    
     elif format == "segment": # target comes first in segment file
         target_seq_name, target_start, target_end, \
-        query_seq_name, query_start, query_end, direction, score = line.split()
+        query_seq_name, query_start, query_end, direction, _ = line.split()
     else:
         sys.exit(f"Error: invalid format {format}")
     # TODO make custom type for return
@@ -228,31 +228,36 @@ def filter_diagonal(lines: list[str], diagonal_radius: int, format: str, debug=F
         if abs(query_mid - target_mid) <= diagonal_radius:
             coordinates.append((int(query_start), int(query_end)))
     return coordinates
-              
+
+def process_line(line: str, diagonal_radius: int, format: str) -> typing.Optional[tuple[int, int]]:
+    direction, query_seq_name, query_start, query_end, target_seq_name, target_start, target_end = parse_line(line, format)
+    if direction == "-":
+        return None
+    assert direction == "+", f"Error: invalid direction {direction}"
+    assert query_seq_name == target_seq_name, f"Error: query and target sequence names do not match: {query_seq_name}, {target_seq_name}"
+    half_dist = int((int(query_end) - int(query_start)) // 2)
+    assert int(query_end) > int(query_start)
+    assert int(target_end) > int(target_start)
+    query_mid = int(query_start) + half_dist
+    target_mid = int(target_start) + half_dist
+    if abs(query_mid - target_mid) <= diagonal_radius:
+        return (int(query_start), int(query_end))
+    return None
+
+def process_chunk(chunk, diagonal_radius: int, format: str):
+    return [process_line(line, diagonal_radius, format) for line in chunk]
+         
 def filter_diagonal_parallel(lines: list[str], diagonal_radius: int, format: str, cores: int = -1, debug=False) -> list[tuple[int, int]]:
     if debug:
         print(f"# Filtering diagonals with radius {diagonal_radius}")
 
-    def process_line(line: str) -> typing.Optional[tuple[int, int]]:
-        direction, query_seq_name, query_start, query_end, target_seq_name, target_start, target_end = parse_line(line, format)
-        if direction == "-":
-            return None
-        assert direction == "+", f"Error: invalid direction {direction}"
-        assert query_seq_name == target_seq_name, f"Error: query and target sequence names do not match: {query_seq_name}, {target_seq_name}"
-        half_dist = int((int(query_end) - int(query_start)) // 2)
-        assert int(query_end) > int(query_start)
-        assert int(target_end) > int(target_start)
-        query_mid = int(query_start) + half_dist
-        target_mid = int(target_start) + half_dist
-        if abs(query_mid - target_mid) <= diagonal_radius:
-            return (int(query_start), int(query_end))
-        return None
-
     chunk_size = max(1, len(lines) // (cores if cores > 0 else 1))
     chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
+    
+    process_chunk_with_radius = partial(process_chunk, diagonal_radius=diagonal_radius, format=format)
 
     with ProcessPoolExecutor(max_workers=cores if cores > 0 else None) as executor:
-        results = list(executor.map(lambda chunk: [process_line(line) for line in chunk], chunks))
+        results = list(executor.map(process_chunk_with_radius, chunks))
     
     # Flatten the list of results
     results = [item for sublist in results for item in sublist if item is not None]
@@ -454,4 +459,3 @@ if __name__ == "__main__":
                 print(f"{chr_name}\t{interval[0]}\t{interval[1]}\n", file=sys.stderr, end="")
             else:
                 print(f"{chr_name} {interval[0]}:{interval[1]}\n", file=sys.stderr, end="")
-
